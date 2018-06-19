@@ -12,7 +12,7 @@
 //   Baud rate changed to: 115200                             //
 ////////////////////////////////////////////////////////////////
 
-//#define DEBUG_USE_IO_EXPANDER
+#define DEBUG_USE_IO_EXPANDER
 
 #include <app_cfg.h>
 #include <cpu_core.h>
@@ -52,6 +52,7 @@
 
 // Stepper driving constants
 #if defined DEBUG_USE_IO_EXPANDER
+
 	#define X_STEP_POS		0x03
 	#define X_STEP_NEG		0x02
 	#define Y_STEP_POS		0x0C
@@ -59,6 +60,9 @@
 
 	#define X_MOTOR_STOP	0x00
 	#define Y_MOTOR_STOP	0x00
+
+	#define X_DIR_POS		0x01
+	#define X_DIR_NEG		0x00
 
 #else
 
@@ -74,31 +78,24 @@
 	#define Y_STEP			P1_0_set();
 	#define Y_STOP			P1_0_reset();
 
-	//#define X_STEP_POS		{P3_3_set(); P3_4_set();}
-	//#define X_STEP_NEG		{P3_3_reset(); P3_4_set();}
-	//#define Y_STEP_POS		{P1_8_set(); P1_0_set();}
-	//#define Y_STEP_NEG		{P1_8_reset(); P1_0_set();}
-
-	//#define X_MOTOR_STOP	{P3_3_reset(); P3_4_reset();}
-	//#define Y_MOTOR_STOP	{P1_8_reset(); P1_0_reset();}
-
-	//#define DIR_M1		P3_3_set()
-	//#define STEP_M1		P0_7_set()
-	//#define DIR_M2		P1_8_set()
-	//#define STEP_M2		P1_0_set()
 #endif
 
 // Servo definitions
 #define CCU40_20MS		(uint16_t)9370
-#define PEN_MID_POS		(uint16_t)CCU40_20MS * (20 - 1.5) / 20
-#define PEN_UP_POS		(uint16_t)CCU40_20MS * (20 - 1.2) / 20
-#define PEN_DOWN_POS	(uint16_t)CCU40_20MS * (20 - 1.8) / 20
+#define PEN_MID_POS		(uint16_t)CCU40_20MS * (20 - 1.5) / 20 	// 1.5 is the HIGH time in milliseconds
+#define PEN_UP_POS		(uint16_t)CCU40_20MS * (20 - 1.2) / 20	// 1.2 is the HIGH time in milliseconds
+#define PEN_DOWN_POS	(uint16_t)CCU40_20MS * (20 - 1.8) / 20	// 1.8 is the HIGH time in milliseconds
+#define PEN_DELAY		(uint32_t)3000000
 
 // Endpoint GPIO Macros
 #define ENDSTOP_RIGHT	P1_12_read()
 #define ENDSTOP_LEFT	P1_14_read()
 #define ENDSTOP_BOTTOM	P1_13_read()
 #define ENDSTOP_TOP		P1_15_read()
+
+// Stepper delays
+#define STEP_PULSE		1000		// Time for HIGH level duration
+#define STEP_DELAY		25000		// Time delay between steps
 
 // Task definition variables
 static  CPU_STK  AppStartTaskStk[APP_CFG_TASK_START_STK_SIZE];
@@ -122,33 +119,33 @@ static void AppTaskCom(void *p_arg);
 static void penUp();
 static void penDown();
 static void startCommand();
-static void finCommand();
-static void moveToLineToCommand(int xTo, int yTo);
+static bool finCommand();
+static bool moveToLineToCommand(uint32_t xTo, uint32_t yTo);
 static void curveToCommand();
 
 typedef enum parameterType
 {
-	INT,
+	UINT,
 	CHAR,
 	STRING
 } parameterType_t;
 
 static void *getParamById(CPU_CHAR* pUARTMessage, uint8_t paramID, parameterType_t PT);
-
 static void initCCU4X(XMC_CCU4_MODULE_t *pCCU, XMC_CCU4_SLICE_t *pSlice, uint8_t sliceNumber, uint32_t prescaler, const XMC_GPIO_PORT_t *pPort, const uint8_t pin);
-//static void initCCU4X(XMC_CCU4_MODULE_t *pCCU, XMC_CCU4_SLICE_t *pSlice, uint8_t sliceNumber, const XMC_GPIO_PORT_t *pPort, const uint8_t pin);
 static void  setCCU4X(XMC_CCU4_MODULE_t *pCCU, XMC_CCU4_SLICE_t *pSlice, uint8_t sliceNumber, uint16_t periodValue, uint16_t pwmValue);
 
 static const uint32_t CCU4_SHADOW_TRANSFER_SLICES[] = { 1u, 16u, 256u, 4096u };
 
 // Max X and Y Steps for the whole working area
-static int MaxX = 0;
-static int MaxY = 0;
+static uint32_t MaxX = 0;
+static uint32_t MaxY = 0;
 
 // Current Positions
-static int CurX = 0;
-static int CurY = 0;
+static uint32_t CurX = 0;
+static uint32_t CurY = 0;
 
+// Pen up
+static bool isPenUp = false;
 
 // This is the standard entry point for C code.
 int main (void)
@@ -369,13 +366,14 @@ static void AppTaskCom(void *p_arg)
 	OS_ERR      err;
 	OS_MSG_SIZE messageSize;
 
-	char    UARTrequestMessage[MAX_MSG_LENGTH];
-	char	UARTresponseMessage[MAX_MSG_LENGTH];
+	char    	UARTrequestMessage[MAX_MSG_LENGTH];
+	char		UARTresponseMessage[MAX_MSG_LENGTH];
 
 	int n = 0;
 	char commandType = '\0';
-	int xTo, yTo = 0;
+	uint32_t xTo, yTo = 0;
 
+	bool commandSuccess = false;
 
 	(void) p_arg;
 	APP_TRACE_INFO ("Entering AppTaskCom...\n");
@@ -408,10 +406,9 @@ static void AppTaskCom(void *p_arg)
 				printf("INFO: UART Message received: '%s'\n", UARTrequestMessage);
 			#endif
 
-			printf("Param 0: %i\n", (int)getParamById(UARTrequestMessage, 0, INT));
-			printf("Param 1: %i\n", (int)getParamById(UARTrequestMessage, 1, INT));
-			printf("Param 2: %c\n", (char)getParamById(UARTrequestMessage, 2, CHAR));
-			printf("Param 3: %s\n", (char *)getParamById(UARTrequestMessage, 3, STRING));
+			printf("Param 0 (C): %c\n", (char)getParamById(UARTrequestMessage, 0, CHAR));
+			printf("Param 1 (X): %u\n", (uint32_t)getParamById(UARTrequestMessage, 1, UINT));
+			printf("Param 2 (Y): %u\n", (uint32_t)getParamById(UARTrequestMessage, 2, UINT));
 
 			commandType = (char)getParamById(UARTrequestMessage, 0, CHAR);
 
@@ -433,14 +430,23 @@ static void AppTaskCom(void *p_arg)
 					penUp();
 
 					// Get the coordinates
-					xTo = (int)getParamById(UARTrequestMessage, 1, INT);
-					yTo = (int)getParamById(UARTrequestMessage, 2, INT);
+					xTo = (uint32_t)getParamById(UARTrequestMessage, 1, UINT);
+					yTo = (uint32_t)getParamById(UARTrequestMessage, 2, UINT);
 
 					// Move to X/Y
-					moveToLineToCommand(xTo, yTo);
+					commandSuccess = moveToLineToCommand(xTo, yTo);
 
-					// Return ACK to PC
-					snprintf(UARTresponseMessage, MAX_MSG_LENGTH - 1, "#M:ACK$");
+					if (commandSuccess)
+					{
+						// Return ACK to PC
+						snprintf(UARTresponseMessage, MAX_MSG_LENGTH - 1, "#M:ACK$");
+					}
+					else
+					{
+						// Return NACK to PC
+						snprintf(UARTresponseMessage, MAX_MSG_LENGTH - 1, "#M:NACK$");
+					}
+
 					break;
 
 				case 'L': // DRAW LINE command
@@ -448,14 +454,22 @@ static void AppTaskCom(void *p_arg)
 					penDown();
 
 					// Get the coordinates
-					xTo = (int)getParamById(UARTrequestMessage, 1, INT);
-					yTo = (int)getParamById(UARTrequestMessage, 2, INT);
+					xTo = (uint32_t)getParamById(UARTrequestMessage, 1, UINT);
+					yTo = (uint32_t)getParamById(UARTrequestMessage, 2, UINT);
 
-					// Move to X/Y
-					moveToLineToCommand(xTo, yTo);
+					// Line to X/Y
+					commandSuccess = moveToLineToCommand(xTo, yTo);
 
-					// Return ACK to PC
-					snprintf(UARTresponseMessage, MAX_MSG_LENGTH - 1, "#L:ACK$");
+					if (commandSuccess)
+					{
+						// Return ACK to PC
+						snprintf(UARTresponseMessage, MAX_MSG_LENGTH - 1, "#L:ACK$");
+					}
+					else
+					{
+						// Return NACK to PC
+						snprintf(UARTresponseMessage, MAX_MSG_LENGTH - 1, "#L:NACK$");
+					}
 					break;
 
 				case 'C': // DRAW CURVE command
@@ -474,10 +488,20 @@ static void AppTaskCom(void *p_arg)
 					penUp();
 
 					// Return to X/Y 0/0
-					finCommand();
+					commandSuccess = finCommand();
 
-					// Return ACK to PC
-					snprintf(UARTresponseMessage, MAX_MSG_LENGTH - 1, "#F:ACK$");
+					if (commandSuccess)
+					{
+						// Return ACK to PC
+						snprintf(UARTresponseMessage, MAX_MSG_LENGTH - 1, "#F:ACK$");
+					}
+					else
+					{
+						// Return NACK to PC
+						snprintf(UARTresponseMessage, MAX_MSG_LENGTH - 1, "#F:NACK$");
+					}
+
+					break;
 
 				default:
 					break;
@@ -491,42 +515,9 @@ static void AppTaskCom(void *p_arg)
 			}
 
 			// Transmit Line Break for debugging
-			XMC_UART_CH_Transmit(XMC_UART1_CH1, '\n');
+			// XMC_UART_CH_Transmit(XMC_UART1_CH1, '\n');
 
-
-			#if 0
-			// Get the pointer to the Separator of the Duty Cycle
-			pPWMValue = strchr(UARTrequestMessage, SEP);
-
-			// Separator found?
-			if (pPWMValue != NULL)
-			{
-				// Get the CCU length
-				CCULength = pPWMValue - UARTrequestMessage;
-
-				// Get the CCU Number from the UARTrequestMessage buffer
-				memcpy(CCUNumberBuffer, UARTrequestMessage, CCULength);
-
-				// Roll over the separator character
-				pPWMValue++;
-
-				// Convert CCU Number string to value
-				CCUNumber = strtol(CCUNumberBuffer, NULL, 10);
-
-				// Convert PWM Value string to value
-				PWMValue = strtol(pPWMValue, NULL, 10);
-
-				#if (APP_TRACE_LEVEL >= TRACE_LEVEL_INFO)
-					printf("CCU: %ld\tPWM: %ld\n", CCUNumber, PWMValue);
-				#endif
-
-			}
-			else
-			{
-				// Separator not found -> Invalid Command
-				APP_TRACE_DBG("ERROR: Invalid command!\n");
-			}
-			#endif
+			printf("Current Plotter Position: X = %u / Y = %u\n", CurX, CurY);
 
 		}
 
@@ -538,6 +529,7 @@ static void AppTaskCom(void *p_arg)
 	}
 }
 
+// Returns the parameter with the specified id and data type
 static void *getParamById(char* pUARTMessage, uint8_t paramID, parameterType_t PT)
 {
 	// Example: #<0:1:2:3:4:5...>$
@@ -612,9 +604,9 @@ static void *getParamById(char* pUARTMessage, uint8_t paramID, parameterType_t P
 	// Which type of parameter do we want?
 	switch (PT)
 	{
-		case INT:
+		case UINT:
 			// Convert the parameter to integer
-			return (int)strtol(parameterBuffer, NULL, 10);
+			return (uint32_t)strtol(parameterBuffer, NULL, 10);
 			break;
 
 		case CHAR:
@@ -632,53 +624,177 @@ static void *getParamById(char* pUARTMessage, uint8_t paramID, parameterType_t P
 	}
 }
 
-#define PEN_DELAY (uint32_t)3000000
+
 
 
 static void penUp()
 {
 	uint32_t delayCounter = PEN_DELAY;
 
-	setCCU4X(CCU40, CCU40_CC40, 0, CCU40_20MS, PEN_UP_POS);
+	if (!isPenUp)
+	{
+		setCCU4X(CCU40, CCU40_CC40, 0, CCU40_20MS, PEN_UP_POS);
 
-	while (delayCounter > 0)
-		delayCounter--;
+		while (delayCounter > 0)
+			delayCounter--;
+
+		isPenUp = true;
+	}
 }
 
 static void penDown()
 {
 	uint32_t delayCounter = PEN_DELAY;
 
-	setCCU4X(CCU40, CCU40_CC40, 0, CCU40_20MS, PEN_DOWN_POS);
+	if (isPenUp)
+	{
+		setCCU4X(CCU40, CCU40_CC40, 0, CCU40_20MS, PEN_DOWN_POS);
 
-	while (delayCounter > 0)
-		delayCounter--;
+		while (delayCounter > 0)
+			delayCounter--;
+
+		isPenUp = false;
+	}
 }
 
+// Performs a reference drive.
+// Drives to the lower right corner and the drives back to upper left corner and counts the steps
 static void startCommand()
 {
+	uint32_t delayCounter = 0;
 
+	MaxX = 0;
+	MaxY = 0;
+
+	#if defined DEBUG_USE_IO_EXPANDER
+		// NOP
+	#else
+		X_DIR_POS;
+		Y_DIR_POS;
+	#endif
+
+	delayCounter = STEP_DELAY;
+	while (delayCounter > 0)
+		delayCounter--;
+
+	// Drive to lower right corner
+	while (true)
+	{
+		if (ENDSTOP_RIGHT != 0)
+		{
+			#if defined DEBUG_USE_IO_EXPANDER
+				_mcp23s08_reg_xfer(XMC_SPI1_CH0, MCP23S08_GPIO, X_STEP_POS, MCP23S08_WR);
+			#else
+				X_STEP;
+			#endif
+		}
+
+		if (ENDSTOP_BOTTOM != 0)
+		{
+			#if defined DEBUG_USE_IO_EXPANDER
+				_mcp23s08_reg_xfer(XMC_SPI1_CH0, MCP23S08_GPIO, Y_STEP_POS, MCP23S08_WR);
+			#else
+				Y_STEP;
+			#endif
+		}
+
+		delayCounter = STEP_PULSE;
+		while (delayCounter > 0)
+			delayCounter--;
+
+		#if defined DEBUG_USE_IO_EXPANDER
+			_mcp23s08_reg_xfer(XMC_SPI1_CH0, MCP23S08_GPIO, X_MOTOR_STOP | Y_MOTOR_STOP, MCP23S08_WR);
+		#else
+			X_STOP;
+			Y_STOP;
+		#endif
+
+		delayCounter = STEP_DELAY;
+		while (delayCounter > 0)
+			delayCounter--;
+
+		if (ENDSTOP_RIGHT == 0 && ENDSTOP_BOTTOM == 0)
+		{
+			break;
+		}
+	}
+
+	#if defined DEBUG_USE_IO_EXPANDER
+
+	#else
+		X_DIR_NEG;
+		Y_DIR_NEG;
+	#endif
+
+	delayCounter = STEP_DELAY;
+	while (delayCounter > 0)
+		delayCounter--;
+
+	// Drive to lower left corner and count the steps
+	while (true)
+	{
+		if (ENDSTOP_LEFT != 0)
+		{
+			#if defined DEBUG_USE_IO_EXPANDER
+				_mcp23s08_reg_xfer(XMC_SPI1_CH0, MCP23S08_GPIO, X_STEP_NEG, MCP23S08_WR);
+			#else
+				X_STEP;
+			#endif
+
+			MaxX++;
+		}
+
+		if (ENDSTOP_TOP != 0)
+		{
+			#if defined DEBUG_USE_IO_EXPANDER
+				_mcp23s08_reg_xfer(XMC_SPI1_CH0, MCP23S08_GPIO, Y_STEP_NEG, MCP23S08_WR);
+			#else
+				Y_STEP;
+			#endif
+
+			MaxY++;
+		}
+
+		delayCounter = STEP_PULSE;
+		while (delayCounter > 0)
+			delayCounter--;
+
+		#if defined DEBUG_USE_IO_EXPANDER
+			_mcp23s08_reg_xfer(XMC_SPI1_CH0, MCP23S08_GPIO, X_MOTOR_STOP | Y_MOTOR_STOP, MCP23S08_WR);
+		#else
+			X_STOP;
+			Y_STOP;
+		#endif
+
+		delayCounter = STEP_DELAY;
+		while (delayCounter > 0)
+			delayCounter--;
+
+		if (ENDSTOP_LEFT == 0 && ENDSTOP_TOP == 0)
+		{
+			break;
+		}
+	}
 }
 
-static void finCommand()
+static bool finCommand()
 {
+	// Move to 0/0
+	bool commandSuccess = moveToLineToCommand(0, 0);
 
+	return commandSuccess;
 }
 
 
-#define STEP_DELAY	50000 //25000
-
-
-
-
-static void moveToLineToCommand(int xTo, int yTo)
+// Drives the plotter to specified positions in a line.
+// Returns true on success or false, if destination is outside of MaxX/MaxY
+static bool moveToLineToCommand(uint32_t xTo, uint32_t yTo)
 {
-
-	int n = 0;
-	int delayCounter = 0;
-	int loopLength = 0;
-	int deltaX = 0;
-	int deltaY = 0;
+	uint32_t n = 0;
+	uint32_t delayCounter = 0;
+	uint32_t loopLength = 0;
+	uint32_t deltaX = 0;
+	uint32_t deltaY = 0;
 
 	int scaleFactor = 0;
 	int scaleFactorCounter = 0;
@@ -686,7 +802,25 @@ static void moveToLineToCommand(int xTo, int yTo)
 	bool driveXPos = false;
 	bool driveYPos = false;
 
+	bool allowDriveX = false;
+	bool allowDriveY = false;
 
+	// Check destination
+	if (xTo > MaxX || yTo > MaxY)
+	{
+		return false;
+	}
+
+	// Check if we want to go online in one direction
+	if (CurX != xTo)
+	{
+		allowDriveX = true;
+	}
+
+	if (CurY != yTo)
+	{
+		allowDriveY = true;
+	}
 
 	// Calculate drive direction X
 	if (xTo > CurX)
@@ -706,36 +840,53 @@ static void moveToLineToCommand(int xTo, int yTo)
 	if (driveXPos)
 	{
 		deltaX = xTo - CurX;
-		X_DIR_POS;
+
+		#ifndef DEBUG_USE_IO_EXPANDER
+			X_DIR_POS;
+		#endif
 	}
+
 	else
 	{
 		deltaX = CurX - xTo;
-		X_DIR_NEG;
+
+		#ifndef DEBUG_USE_IO_EXPANDER
+			X_DIR_NEG;
+		#endif
 	}
 
 	// Calculate delta distance Y and change the stepper direction
 	if (driveYPos)
 	{
 		deltaY = yTo - CurY;
-		Y_DIR_POS;
+
+		#ifndef DEBUG_USE_IO_EXPANDER
+			Y_DIR_POS;
+		#endif
 	}
 	else
 	{
 		deltaY = CurY - yTo;
-		Y_DIR_NEG;
+
+		#ifndef DEBUG_USE_IO_EXPANDER
+			Y_DIR_NEG;
+		#endif
 	}
 
 	// Check larger delta
 	if (deltaX > deltaY)
 	{
 		loopLength = deltaX;
-		scaleFactor = deltaX / deltaY;
+
+		if (allowDriveY)
+			scaleFactor = deltaX / deltaY;
 	}
 	else
 	{
 		loopLength = deltaY;
-		scaleFactor = deltaY / deltaX;
+
+		if (allowDriveX)
+			scaleFactor = deltaY / deltaX;
 	}
 
 	delayCounter = STEP_DELAY;
@@ -748,36 +899,99 @@ static void moveToLineToCommand(int xTo, int yTo)
 		if (deltaX > deltaY)
 		{
 			// Drive each step with motor X
-			X_STEP;
+			if (allowDriveX)
+			{
+				#if defined DEBUG_USE_IO_EXPANDER
+					if (driveXPos)
+					{
+						_mcp23s08_reg_xfer(XMC_SPI1_CH0, MCP23S08_GPIO, X_STEP_POS, MCP23S08_WR);
+					}
+					else
+					{
+						_mcp23s08_reg_xfer(XMC_SPI1_CH0, MCP23S08_GPIO, X_STEP_NEG, MCP23S08_WR);
+					}
+				#else
+					X_STEP;
+				#endif
+			}
 
 			scaleFactorCounter++;
 
 			if (scaleFactorCounter == scaleFactor)
 			{
 				scaleFactorCounter = 0;
-				Y_STEP;
+
+				if (allowDriveY)
+				{
+					#if defined DEBUG_USE_IO_EXPANDER
+						if (driveYPos)
+						{
+							_mcp23s08_reg_xfer(XMC_SPI1_CH0, MCP23S08_GPIO, Y_STEP_POS, MCP23S08_WR);
+						}
+						else
+						{
+							_mcp23s08_reg_xfer(XMC_SPI1_CH0, MCP23S08_GPIO, Y_STEP_NEG, MCP23S08_WR);
+						}
+					#else
+						Y_STEP;
+					#endif
+				}
+
 			}
 		}
 		else
 		{
-			Y_STEP;
+			if (allowDriveY)
+			{
+				#if defined DEBUG_USE_IO_EXPANDER
+					if (driveYPos)
+					{
+						_mcp23s08_reg_xfer(XMC_SPI1_CH0, MCP23S08_GPIO, Y_STEP_POS, MCP23S08_WR);
+					}
+					else
+					{
+						_mcp23s08_reg_xfer(XMC_SPI1_CH0, MCP23S08_GPIO, Y_STEP_NEG, MCP23S08_WR);
+					}
+				#else
+					Y_STEP;
+				#endif
+			}
+
 
 			scaleFactorCounter++;
 
 			if (scaleFactorCounter == scaleFactor)
 			{
 				scaleFactorCounter = 0;
-				X_STEP;
+
+				if (allowDriveX)
+				{
+					#if defined DEBUG_USE_IO_EXPANDER
+						if (driveXPos)
+						{
+							_mcp23s08_reg_xfer(XMC_SPI1_CH0, MCP23S08_GPIO, X_STEP_POS, MCP23S08_WR);
+						}
+						else
+						{
+							_mcp23s08_reg_xfer(XMC_SPI1_CH0, MCP23S08_GPIO, X_STEP_NEG, MCP23S08_WR);
+						}
+					#else
+						X_STEP;
+					#endif
+				}
 			}
 		}
 
-
-		delayCounter = 1000;
+		delayCounter = STEP_PULSE;
 		while (delayCounter > 0)
 			delayCounter--;
 
-		X_STOP;
-		Y_STOP;
+		#if defined DEBUG_USE_IO_EXPANDER
+			_mcp23s08_reg_xfer(XMC_SPI1_CH0, MCP23S08_GPIO, X_MOTOR_STOP | Y_MOTOR_STOP, MCP23S08_WR);
+		#else
+			X_STOP;
+			Y_STOP;
+		#endif
 
 		delayCounter = STEP_DELAY;
 		while (delayCounter > 0)
@@ -789,48 +1003,12 @@ static void moveToLineToCommand(int xTo, int yTo)
 	CurX = xTo;
 	CurY = yTo;
 
-	printf("Current Position: %i/%i\n", CurX, CurY);
-
-#if 0
-
-	return;
-
-	P3_3_set();
-
-	for (n = CurX; n < xTo; n++)
-	{
-		//X_STEP_POS;
-
-
-
-		P3_4_set();
-
-
-
-		delayCounter = 1000;
-		while (delayCounter > 0)
-			delayCounter--;
-
-		P3_4_reset();
-		//X_MOTOR_STOP;
-
-		delayCounter = 1000;
-		while (delayCounter > 0)
-			delayCounter--;
-
-
-		delayCounter = STEP_DELAY;
-		while (delayCounter > 0)
-			delayCounter--;
-
-	}
-
-#endif
+	return true;
 }
 
 static void curveToCommand()
 {
-
+ // TODO
 }
 
 static void initCCU4X(XMC_CCU4_MODULE_t *pCCU, XMC_CCU4_SLICE_t *pSlice, uint8_t sliceNumber, uint32_t prescaler, const XMC_GPIO_PORT_t *pPort, const uint8_t pin)
